@@ -1,0 +1,239 @@
+/*
+  ESP8266 Water Flow Meter + SSD1306 OLED + ThingSpeak
+  Wiring (use exactly):
+    Flow sensor (YF-S201):
+      VCC -> 5V
+      GND -> GND (common)
+      SIGNAL (yellow) -> D2 (GPIO4)
+
+    OLED SSD1306 (I2C):
+      VCC -> 3.3V
+      GND -> GND
+      SDA -> D3 (GPIO0)
+      SCL -> D4 (GPIO2)
+*/
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+// ---------- CONFIG ----------
+const char* ssid = "Manoj";           // <- change to your WiFi SSID
+const char* password = "987654321";   // <- change to your WiFi password
+const char apiKey[] = "7O2DRLS9WX9TBXFY"; // <- change to your ThingSpeak Write API key
+const char hostTS[] = "api.thingspeak.com";
+
+// Pins
+#define FLOW_PIN D2   // flow sensor signal
+#define SDA_PIN  D3   // OLED SDA
+#define SCL_PIN  D4   // OLED SCL
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Calibration & timing
+float calibrationFactor = 4.5f;   // change if you need to calibrate
+const unsigned long SAMPLE_MS = 1000UL;   // sample every 1 second
+const unsigned long THINGSPEAK_MS = 15000UL; // ThingSpeak min 15s
+
+// Globals
+volatile unsigned int pulseCount = 0;    // incremented in ISR
+unsigned long lastSample = 0;
+unsigned long lastThingSpeak = 0;
+unsigned long totalMilliLitres = 0;
+float flowRate = 0.0f;   // L/min
+
+// Forward
+void ICACHE_RAM_ATTR pulseCounter();
+
+// ----------------- SETUP -----------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println(F("=== Water Flow Meter starting ==="));
+
+  // Initialize I2C on safe pins (avoid conflicts with D2)
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed - check wiring/address"));
+  } else {
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println("Water Flow Meter");
+    display.println("Initializing...");
+    display.display();
+  }
+  // Flow sensor pin + ISR
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+
+  // Wi-Fi connect (with timeout)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.printf("Connecting to WiFi '%s' ...\n", ssid);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 20000UL) {
+    Serial.print('.');
+    delay(300);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+  } else {
+    Serial.println("WiFi connection failed (timeout). Will retry in loop.");
+  }
+  lastSample = millis();
+  lastThingSpeak = millis() - THINGSPEAK_MS; // allow immediate first post
+}
+
+// ----------------- ISR -----------------
+void ICACHE_RAM_ATTR pulseCounter() {
+  pulseCount++;
+}
+
+// ----------------- Helper: show status on OLED -----------------
+void displayStatus(const char* line1, const char* line2, const char* line3) {
+  if (display.width() == 0) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println(line1);
+  display.println();
+  display.println(line2);
+  display.println();
+  display.println(line3);
+  display.display();
+}
+// ----------------- Main Loop -----------------
+void loop() {
+  unsigned long now = millis();
+
+  // --- Sampling every SAMPLE_MS ---
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+
+    // snapshot pulses safely
+    noInterrupts();
+    unsigned int pulses = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    // compute using exact elapsed time (SAMPLE_MS)
+    // flowRate in L/min = (pulses / calibrationFactor) * (60 / seconds)
+    // since pulses measured over SAMPLE_MS ms, scale accordingly:
+    flowRate = ((1000.0f / (float)SAMPLE_MS) * (float)pulses) / calibrationFactor; // L/min
+
+    // volume during this SAMPLE_MS
+    float litresThisInterval = (flowRate / 60.0f); // litres in SAMPLE_MS (approx)
+    unsigned long mlThis = (unsigned long)(litresThisInterval * 1000.0f + 0.5f);
+    totalMilliLitres += mlThis;
+
+    float totalLitres = (float)totalMilliLitres / 1000.0f;
+
+    // Serial debug
+    Serial.printf("[Sample] Pulses=%u  FlowRate=%.3f L/min  ml=%lu  Total=%.3f L\n",
+                  pulses, flowRate, mlThis, totalLitres);
+
+    // OLED display
+    if (display.width() > 0) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0,0);
+      display.print("Water Flow Meter");
+      display.setCursor(0,12);
+      display.setTextSize(2);
+      display.print("R:");
+      display.print(flowRate, 2);
+      display.setTextSize(1);
+      display.setCursor(90,18);
+      display.print("L/min");
+      display.setTextSize(1);
+      display.setCursor(0,40);
+      display.print("Last mL: ");
+      display.print(mlThis);
+      display.setCursor(0,52);
+      display.print("Total L: ");
+      display.print(totalLitres, 3);
+
+      display.display();
+    }
+  }
+
+  // --- ThingSpeak update every THINGSPEAK_MS ---
+  if (now - lastThingSpeak >= THINGSPEAK_MS) {
+    lastThingSpeak = now;
+
+    // Ensure WiFi connected (try reconnect)
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi not connected - attempting reconnect...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 10000UL) {
+        delay(200);
+      }
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi reconnect failed - skipping ThingSpeak post");
+        displayStatus("ThingSpeak post skipped", "WiFi not connected", "");
+        
+      } else {
+        Serial.print("WiFi reconnected. IP: ");
+        Serial.println(WiFi.localIP());
+      }
+    }
+
+    // Build HTTP POST body in a safe char buffer
+    float totalLitres = (float)totalMilliLitres / 1000.0f;
+    char postBody[128];
+    int blen = snprintf(postBody, sizeof(postBody),
+                        "api_key=%s&field1=%.3f&field2=%.3f",
+                        apiKey, flowRate, totalLitres);
+    if (blen <= 0) {
+      Serial.println("Error building POST body");
+      
+    }
+
+    // Send POST using HTTPClient with WiFiClient
+    WiFiClient client;
+    HTTPClient http;
+    String url = String("http://") + hostTS + "/update";
+    Serial.println();
+    Serial.print("Posting to ThingSpeak: ");
+    Serial.println(url);
+    Serial.print("Body: ");
+    Serial.println(postBody);
+
+    http.begin(client, url); // correct API: pass WiFiClient
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    int httpCode = http.POST(String(postBody)); // safe for this small payload
+
+    if (httpCode > 0) {
+      Serial.printf("HTTP code: %d\n", httpCode);
+      String payload = http.getString();
+      Serial.print("Response: ");
+      Serial.println(payload);
+      if (payload.toInt() > 0) {
+        Serial.println("ThingSpeak accepted data (entry id > 0)");
+        displayStatus("ThingSpeak: OK", "Posted data", payload.c_str());
+      } else {
+        Serial.println("ThingSpeak returned 0 (rate-limited or wrong key)");
+        displayStatus("ThingSpeak error", "Returned 0 - check key", "");
+      }
+    } else {
+      Serial.printf("POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+      displayStatus("ThingSpeak POST failed", http.errorToString(httpCode).c_str(), "");
+    }
+    http.end();
+  }
+
+  // small yield
+  delay(10);
+}
